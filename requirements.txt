@@ -1,0 +1,9 @@
+swig
+scikit-learn
+tqdm==4.65.0
+gymnasium[box2d, classic-control, mujoco]
+numpy==1.26.4
+matplotlib
+pyglet==1.5.27
+torch==2.6
+pyyaml
