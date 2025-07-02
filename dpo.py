@@ -9,6 +9,9 @@ from tqdm import tqdm
 from batch_collection import collect_pair_data
 import argparse
 import yaml
+from imitation import ImitationTrainer,il_reorganize_data
+from ppo import train,make_env
+from scipy.stats import kstest, pearsonr
 class PairedTrajectoryDataset(Dataset):
     def __init__(self, pair_data):
         self.data = pair_data
@@ -52,7 +55,7 @@ class DPOTrainer:
         max_reward = 0
 
         for iteration in range(num_iterations):
-            pair_data = collect_pair_data(self.policy,seed,1000)
+            pair_data = collect_pair_data(self.policy,seed,1024)
             dataset = PairedTrajectoryDataset(pair_data)
             dataloader = DataLoader(
                 dataset,
@@ -60,18 +63,19 @@ class DPOTrainer:
                 shuffle=True,
                 collate_fn=PairedTrajectoryDataset.collate_fn,
             )
+            self.policy = self.policy.to(self.device)
             for epoch in tqdm(range(num_epochs_per_iter)):
                 for batch in dataloader:
-                    states_1 = batch["traj1_state"]      # shape: (B, T, obs_dim)
-                    actions_1 = batch["traj1_act"]       # shape: (B, T, act_dim)
-                    logps_1 = batch["traj1_logp"]        # shape: (B, T)
+                    states_1 = batch["traj1_state"].to(self.device)      # shape: (B, T, obs_dim)
+                    actions_1 = batch["traj1_act"].to(self.device)       # shape: (B, T, act_dim)
+                    logps_1 = batch["traj1_logp"].to(self.device)        # shape: (B, T)
 
-                    states_2 = batch["traj2_state"]
-                    actions_2 = batch["traj2_act"]
-                    logps_2 = batch["traj2_logp"]
+                    states_2 = batch["traj2_state"].to(self.device)
+                    actions_2 = batch["traj2_act"].to(self.device)
+                    logps_2 = batch["traj2_logp"].to(self.device)
 
-                    labels = batch["label"]              # shape: (B,)
-
+                    labels = batch["label"].to(self.device)              # shape: (B,)
+                    
                     logps_traj_1 = self.policy.compute_log_likelihood(states_1, actions_1)  # shape: (B, T)
                     logps_traj_2 = self.policy.compute_log_likelihood(states_2, actions_2)
 
@@ -87,30 +91,55 @@ class DPOTrainer:
             print(f"iteration {iteration}: mean reward: {mean_rew:.2f}, std: {std_rew:.2f}")
             if mean_rew > max_reward:
                 max_reward = mean_rew
-                torch.save(self.policy, "dpo_iterative.pt")
+                torch.save(self.policy.state_dict(), "dpo_iterative.pt")
 
 
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = gym.make("Swimmer-v5")
-    policy = ContinuousPolicy(env.observation_space.shape[0], env.action_space.shape[0])
+    num_envs = 4
+    train_env = gym.vector.SyncVectorEnv([make_env("Swimmer-v5") for _ in range(num_envs)])
+    policy = ContinuousPolicy(env.observation_space.shape[0], env.action_space.shape[0]).to(device)
     # load model
-    policy.load_state_dict(torch.load("swimmer_checkpoint.pt", weights_only=False))
-    pair_data = torch.load("pair_data.pt", weights_only=False)
-    pair_data = pair_data[0:1000]
+    #policy.load_state_dict(torch.load("il_policy.pt", weights_only=False,map_location=device))
+    
+    # pair_data = torch.load("pair_data.pt", weights_only=False)
+    # pair_data = pair_data[0:1000]
+    expert_data = torch.load("trajs.pt", weights_only=False)
+    train_expert_data,validate_expert_data = il_reorganize_data(expert_data,True)
+    train_expert_data_noshuffle,validate_expert_data_noshuffle = il_reorganize_data(expert_data,False)
+    shuffle_data = [d[0] for d in train_expert_data]
+    no_shuffle_data = [d[0] for d in train_expert_data_noshuffle]
+    kst_iid = kstest(shuffle_data, 'norm')
+    kst_non_iid = kstest(no_shuffle_data, 'norm')
+    autocorr_iid = pearsonr(shuffle_data[:-1], shuffle_data[1:])[0]
+    autocorr_non_iid = pearsonr(no_shuffle_data[:-1], no_shuffle_data[1:])[0]
+    print("IID Data KS Test:", kst_iid.item().mean())
+    print("Non-IID Data KS Test:", kst_non_iid.mean())
+    print("IID Data Autocorrelation:", autocorr_iid.mean())
+    print("Non-IID Data Autocorrelation:", autocorr_non_iid.mean())
+    exit()
     # argparse
     # load hparams
     with open("hparam.yaml", "r") as f:
         hparams = yaml.load(f, Loader=yaml.SafeLoader)
 
     optimizer = torch.optim.Adam(policy.parameters(), lr=float(hparams["lr"]))
-    dpo = DPOTrainer(env, policy, optimizer, float(hparams["beta"]), int(hparams["batch_size"]))
+    dpo = DPOTrainer(env, policy, optimizer, float(hparams["beta"]), int(hparams["batch_size"]),device)
+    il = ImitationTrainer(env,train_expert_data,validate_expert_data,policy,optimizer,20,"il_policy.pt")
 
     if hparams["iterative_dpo"]:
         iterations = 10
     else:
         iterations = 1
 
-    dpo.train(pair_data, num_iterations=iterations, seed=42, num_epochs_per_iter=hparams["num_epochs_per_iter"])
+    il.learn()
+    #dpo.train([], num_iterations=iterations, seed=42, num_epochs_per_iter=hparams["num_epochs_per_iter"])
+    # for i in range(30):
+    #     train(train_env,env,policy,optimizer,epochs=25,num_envs=num_envs,gae_lambda=0.95,num_steps=512,minibatch_size=64,ent_coef=0.03,update_epochs=6)
+    #     il.learn_step()
+    #     mean_rew,_ = validate_model(policy,env,40)
+    #     print(f"iteration{i} reward:{mean_rew}")
 
 
 if __name__ == "__main__":

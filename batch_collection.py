@@ -14,30 +14,35 @@ def batch_collection(env, policy, seed, *, total_trajectories=16, smoothing=Fals
     trajectories = []
     num_envs = env.num_envs
     obs, infos = env.reset(seed=seed)
+    policy_cpu = policy.to("cpu")
     current_trajectories = [[] for _ in range(num_envs)]
 
+    pbar = tqdm(total=total_trajectories, desc="Collecting trajectories")
     while len(trajectories) < total_trajectories:
         with torch.no_grad():
-            actions = policy.sample_action(obs,smooth=smoothing).detach().numpy()
-            logps = policy.compute_log_likelihood(obs,actions).detach().numpy()
+            actions = policy_cpu.sample_action(obs,smooth=smoothing).detach().cpu().numpy()
+            logps = policy_cpu.compute_log_likelihood(obs,actions).detach().cpu().numpy()
         next_obs, rewards, terminates, truncates, infos = env.step(actions)
         
         for i in range(env.num_envs):
-            current_trajectories[i].append([obs[i], rewards[i],actions[i],logps[i]])
+            current_trajectories[i].append([obs[i], rewards[i],actions[i],logps[i],terminates[i]])
             if truncates[i]:
-                obs_seq, rew_seq,act_seq,logp_seq= zip(*current_trajectories[i])
+                obs_seq, rew_seq,act_seq,logp_seq,terminate_seq= zip(*current_trajectories[i])
                 obs_seq = np.array(obs_seq)
                 rew_seq = np.array(rew_seq)
                 act_seq = np.array(act_seq)
                 logp_seq = np.array(logp_seq)
-                traj = (obs_seq, rew_seq,act_seq,logp_seq)
+                terminate_seq = np.array(terminate_seq)
+                traj = (obs_seq, rew_seq,act_seq,logp_seq,terminate_seq)
                 trajectories.append(traj)
                 current_trajectories[i] = []
+                pbar.update(1)
                 #print(len(trajectories))
         if truncates[0]:
             obs,_ = env.reset()
         else:
             obs = next_obs
+    pbar.close()
     return trajectories
 
 def pair_trajectories(trajs, temp=1.0, seed=None):
@@ -84,9 +89,10 @@ def main():
     example_env.close()
 
     policy = ContinuousPolicy(obs_dim, act_dim)
-    policy.load_state_dict(torch.load("swimmer_checkpoint.pt", weights_only=False))
+    policy.load_state_dict(torch.load("dpo_iterative.pt", weights_only=False))
+    # policy = torch.load("dpo_iterative.pt", weights_only=False)
 
-    trajectories = batch_collection(env, policy, seed, total_trajectories=1000)
+    trajectories = batch_collection(env, policy, seed, total_trajectories=100)
     #trajectories = torch.load("trajs.pt", weights_only=False)
     mean_reward = np.mean([np.sum(traj[1]) for traj in trajectories])
     std_reward = np.std([np.sum(traj[1]) for traj in trajectories])
